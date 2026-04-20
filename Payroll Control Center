@@ -1,7 +1,7 @@
 /*******************************************************
  * Payroll Control Center
  * - Custom menu: Generate Payroll Workings
- * - Reads Month / Year from the first pending row in PAYROLL_CONTROL
+ * - Reads Month / Year from the first unlocked row in PAYROLL_CONTROL
  * - Creates copy of template in Monthly Payroll Workings folder
  * - Updates copied file META_DATA
  * - Writes row in PAYROLL_CONTROL
@@ -38,7 +38,7 @@ const PCC = Object.freeze({
     YEAR: 'YEAR',
     PAYROLL_WORKINGS_FILE_NAME: 'PAYROLL_WORKINGS_FILE_NAME',
     PAYROLL_WORKINGS_FILE_ID: 'PAYROLL_WORKINGS_FILE_ID',
-    LOCKED_PAYROLL_FILE_ID: 'LOCKED_PAYROLL_FILE_ID',
+    LOCK_STATUS: 'LOCK_STATUS',
     CREATED_ON: 'CREATED_ON',
     CREATED_BY: 'CREATED_BY',
   }),
@@ -58,6 +58,7 @@ const PCC = Object.freeze({
 
   VALUES: Object.freeze({
     LOCK_STATUS_OPEN: 'OPEN',
+    LOCK_STATUS_LOCKED: 'LOCKED',
   }),
 
   PROTECTION: Object.freeze({
@@ -119,22 +120,36 @@ function generatePayrollWorkings() {
       PCC.HEADERS.YEAR,
       PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME,
       PCC.HEADERS.PAYROLL_WORKINGS_FILE_ID,
-      PCC.HEADERS.LOCKED_PAYROLL_FILE_ID,
+      PCC.HEADERS.LOCK_STATUS,
       PCC.HEADERS.CREATED_ON,
       PCC.HEADERS.CREATED_BY,
     ]);
 
-    // Step 1: find first pending row (based on blank PAYROLL_WORKINGS_FILE_NAME)
-    const nextRow = findNextEmptyRowByColumn_(sh, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME]);
+    // Step 1: find first row where LOCK_STATUS is not LOCKED
+    const nextRow = findFirstUnlockedRow_(sh, headerMap);
 
-    // Step 2: stop if any lower row already contains data before current pending row is completed
+    // Step 2: stop if any lower row already contains data before current unlocked row is completed
     const sequenceCheck = validateSequentialEntryDiscipline_(sh, headerMap, nextRow);
     if (sequenceCheck.block) {
       ui.alert('Generate Payroll Workings', sequenceCheck.message, ui.ButtonSet.OK);
       return;
     }
 
-    // Step 3: read Month / Year from first pending row
+    // Step 3: if workings already created for this row but lock not completed, stop
+    const existingFileName = String(sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME]).getDisplayValue() || '').trim();
+    const existingFileId = String(sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_ID]).getDisplayValue() || '').trim();
+    const existingLockStatus = String(sh.getRange(nextRow, headerMap[PCC.HEADERS.LOCK_STATUS]).getDisplayValue() || '').trim().toUpperCase();
+
+    if ((existingFileName || existingFileId) && existingLockStatus !== PCC.VALUES.LOCK_STATUS_LOCKED) {
+      ui.alert(
+        'Generate Payroll Workings',
+        `Row ${nextRow} already has a payroll workings reference but LOCK_STATUS is not LOCKED.\n\nPlease complete the lock process for this row first before generating the next payroll workings file.`,
+        ui.ButtonSet.OK
+      );
+      return;
+    }
+
+    // Step 4: read Month / Year from first unlocked row
     const monthYearVals = sh.getRange(nextRow, headerMap[PCC.HEADERS.MONTH], 1, 2).getDisplayValues()[0];
     const month = String(monthYearVals[0] || '').trim();
     const year = String(monthYearVals[1] || '').trim();
@@ -169,14 +184,14 @@ function generatePayrollWorkings() {
     const payrollMonthKey = `${month}_${year}`;
     const fileName = `Payroll-Workings_${month}_${year}`;
 
-    // Step 4: duplicate checks inside control sheet
+    // Step 5: duplicate checks inside control sheet
     const duplicateCheck = checkDuplicateInControl_(sh, headerMap, payrollMonthKey, fileName, nextRow);
     if (duplicateCheck.block) {
       ui.alert('Generate Payroll Workings', duplicateCheck.message, ui.ButtonSet.OK);
       return;
     }
 
-    // Step 5: duplicate check in target folder
+    // Step 6: duplicate check in target folder
     const workingsFolderId = String(config[PCC.CONFIG_KEYS.WORKINGS_FOLDER_ID] || '').trim();
     if (!workingsFolderId) throw new Error(`Missing CONFIG value: ${PCC.CONFIG_KEYS.WORKINGS_FOLDER_ID}`);
 
@@ -189,7 +204,7 @@ function generatePayrollWorkings() {
       return;
     }
 
-    // Step 6: create file copy
+    // Step 7: create file copy
     const templateFileId = String(config[PCC.CONFIG_KEYS.TEMPLATE_FILE_ID] || '').trim();
     if (!templateFileId) throw new Error(`Missing CONFIG value: ${PCC.CONFIG_KEYS.TEMPLATE_FILE_ID}`);
 
@@ -199,15 +214,14 @@ function generatePayrollWorkings() {
     const copiedFile = templateFile.makeCopy(fileName, workingsFolder);
     const copiedFileId = copiedFile.getId();
 
-    // Step 7: update copied file META_DATA
+    // Step 8: update copied file META_DATA
     const copiedSs = SpreadsheetApp.openById(copiedFileId);
     updateMetaDataKeys_(copiedSs, {
       [PCC.META_KEYS.PAYROLL_MONTH_LABEL]: payrollMonthKey,
       [PCC.META_KEYS.LOCK_STATUS]: PCC.VALUES.LOCK_STATUS_OPEN,
     });
 
-    // Step 8: write values in same pending row
-    // IMPORTANT: PAYROLL_WORKINGS_FILE_ID is written LAST as plain file id
+    // Step 9: write values in same active row
     const createdOn = new Date();
     const createdBy = Session.getActiveUser().getEmail() || '';
 
@@ -218,12 +232,13 @@ function generatePayrollWorkings() {
 
     SpreadsheetApp.flush();
 
-    // Write file id LAST
-    sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_ID]).setValue(copiedFileId);
+    // Write clickable file link LAST
+    sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_ID])
+      .setFormula(`=HYPERLINK("https://docs.google.com/spreadsheets/d/${copiedFileId}/edit","${copiedFileId}")`);
 
     SpreadsheetApp.flush();
 
-    // Step 9: protect all completed rows after success
+    // Step 10: protect all rows where workings file name is filled
     const rowsToProtect = getProtectedRowsByFileName_(sh, headerMap);
     protectionContext.rowsToProtect = rowsToProtect;
 
@@ -335,7 +350,7 @@ function validateRequiredHeaders_(headerMap, requiredHeaders) {
 
 /**
  * Returns rows that already have PAYROLL_WORKINGS_FILE_NAME filled.
- * These are completed rows to protect.
+ * These are the rows to protect.
  */
 function getProtectedRowsByFileName_(sheet, headerMap) {
   const col = headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME];
@@ -354,8 +369,27 @@ function getProtectedRowsByFileName_(sheet, headerMap) {
 }
 
 /**
+ * Finds the first row where LOCK_STATUS is not LOCKED.
+ * This is the active row allowed for processing.
+ */
+function findFirstUnlockedRow_(sheet, headerMap) {
+  const lastRow = Math.max(sheet.getLastRow(), PCC.INPUTS.FIRST_DATA_ROW);
+  const numRows = Math.max(1, lastRow - PCC.INPUTS.HEADER_ROW);
+  const values = sheet.getRange(PCC.INPUTS.FIRST_DATA_ROW, headerMap[PCC.HEADERS.LOCK_STATUS], numRows, 1).getDisplayValues();
+
+  for (let i = 0; i < values.length; i++) {
+    const v = String(values[i][0] || '').trim().toUpperCase();
+    if (v !== PCC.VALUES.LOCK_STATUS_LOCKED) {
+      return PCC.INPUTS.FIRST_DATA_ROW + i;
+    }
+  }
+
+  return lastRow + 1;
+}
+
+/**
  * Stops processing if any lower row already contains data
- * before the current first pending row is completed.
+ * before the current active row is completed and locked.
  */
 function validateSequentialEntryDiscipline_(sheet, headerMap, pendingRow) {
   const lastRow = sheet.getLastRow();
@@ -369,7 +403,7 @@ function validateSequentialEntryDiscipline_(sheet, headerMap, pendingRow) {
     headerMap[PCC.HEADERS.YEAR],
     headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME],
     headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_ID],
-    headerMap[PCC.HEADERS.LOCKED_PAYROLL_FILE_ID],
+    headerMap[PCC.HEADERS.LOCK_STATUS],
     headerMap[PCC.HEADERS.CREATED_ON],
     headerMap[PCC.HEADERS.CREATED_BY],
   ];
@@ -388,9 +422,9 @@ function validateSequentialEntryDiscipline_(sheet, headerMap, pendingRow) {
         return {
           block: true,
           message:
-            `Row ${pendingRow} must be completed first before using lower rows.\n` +
+            `Row ${pendingRow} must be completed and LOCK_STATUS must be LOCKED before using lower rows.\n` +
             `Data is already present in row ${rowNum}.\n\n` +
-            `Please clear all lower-row entries and generate payroll strictly in order.`,
+            `Please clear all lower-row entries and proceed strictly in order.`,
         };
       }
     }
@@ -402,7 +436,7 @@ function validateSequentialEntryDiscipline_(sheet, headerMap, pendingRow) {
 /**
  * Duplicate checks inside PAYROLL_CONTROL:
  * 1) same month key + PAYROLL_WORKINGS_FILE_NAME already filled => block
- * 2) same month key + LOCKED_PAYROLL_FILE_ID already filled => block
+ * 2) same month key already LOCKED in another row => block
  * 3) exact file name already visible in PAYROLL_WORKINGS_FILE_NAME column => block
  *
  * Skips the current target row.
@@ -418,7 +452,7 @@ function checkDuplicateInControl_(sheet, headerMap, payrollMonthKey, fileName, s
 
   const monthKeyCol = headerMap[PCC.HEADERS.PAYROLL_MONTH_KEY] - 1;
   const fileNameCol = headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME] - 1;
-  const lockedPayrollCol = headerMap[PCC.HEADERS.LOCKED_PAYROLL_FILE_ID] - 1;
+  const lockStatusCol = headerMap[PCC.HEADERS.LOCK_STATUS] - 1;
 
   for (let i = 0; i < data.length; i++) {
     const rowNum = PCC.INPUTS.FIRST_DATA_ROW + i;
@@ -426,7 +460,7 @@ function checkDuplicateInControl_(sheet, headerMap, payrollMonthKey, fileName, s
 
     const rowMonthKey = String(data[i][monthKeyCol] || '').trim();
     const rowFileNameDisplay = String(data[i][fileNameCol] || '').trim();
-    const rowLockedPayroll = String(data[i][lockedPayrollCol] || '').trim();
+    const rowLockStatus = String(data[i][lockStatusCol] || '').trim().toUpperCase();
 
     if (rowFileNameDisplay === fileName) {
       return {
@@ -442,10 +476,10 @@ function checkDuplicateInControl_(sheet, headerMap, payrollMonthKey, fileName, s
       };
     }
 
-    if (rowMonthKey === payrollMonthKey && rowLockedPayroll) {
+    if (rowMonthKey === payrollMonthKey && rowLockStatus === PCC.VALUES.LOCK_STATUS_LOCKED) {
       return {
         block: true,
-        message: `A locked payroll reference already exists for month "${payrollMonthKey}" in row ${rowNum}. New workings creation is blocked.`,
+        message: `This payroll month "${payrollMonthKey}" is already LOCKED in row ${rowNum}. New workings creation is blocked.`,
       };
     }
   }
@@ -489,22 +523,6 @@ function updateMetaDataKeys_(spreadsheet, updates) {
       sh.getRange(foundRows[key], 2).setValue(updates[key]);
     }
   });
-}
-
-/**
- * Next empty row based on target column.
- */
-function findNextEmptyRowByColumn_(sheet, columnNumber) {
-  const lastRow = Math.max(sheet.getLastRow(), PCC.INPUTS.FIRST_DATA_ROW);
-  const numRows = Math.max(1, lastRow - PCC.INPUTS.HEADER_ROW);
-  const values = sheet.getRange(PCC.INPUTS.FIRST_DATA_ROW, columnNumber, numRows, 1).getDisplayValues();
-
-  for (let i = 0; i < values.length; i++) {
-    const v = String(values[i][0] || '').trim();
-    if (!v) return PCC.INPUTS.FIRST_DATA_ROW + i;
-  }
-
-  return lastRow + 1;
 }
 
 /**
