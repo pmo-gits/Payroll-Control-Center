@@ -1,0 +1,475 @@
+/*******************************************************
+ * Payroll Control Center
+ * - Custom menu: Generate Payroll Workings
+ * - Reads Month / Year dropdowns from B2 / C2
+ * - Creates copy of template in Monthly Payroll Workings folder
+ * - Updates copied file META_DATA
+ * - Writes row in PAYROLL_CONTROL
+ * - Rebuilds script-managed protections on required cells
+ *
+ * REQUIRED TABS:
+ * 1) PAYROLL_CONTROL
+ * 2) CONFIG
+ * 3) META_DATA (inside template file)
+ *
+ * CONFIG KEYS REQUIRED:
+ * - TEMPLATE_PAYROLL_GENERATOR_FILE_ID
+ * - MONTHLY_PAYROLL_WORKINGS_FOLDER_ID
+ * - LOCKED_PAYROLL_FILES_FOLDER_ID
+ * - BANK_TRANSFER_FILES_FOLDER_ID
+ * - CONTROL_FILE_NAME
+ *******************************************************/
+
+const PCC = Object.freeze({
+  SHEETS: Object.freeze({
+    PAYROLL_CONTROL: 'PAYROLL_CONTROL',
+    CONFIG: 'CONFIG',
+    META_DATA: 'META_DATA',
+  }),
+
+  INPUTS: Object.freeze({
+    MONTH_CELL: 'B2',
+    YEAR_CELL: 'C2',
+    HEADER_ROW: 1,
+    FIRST_DATA_ROW: 2,
+  }),
+
+  HEADERS: Object.freeze({
+    PAYROLL_MONTH_KEY: 'PAYROLL_MONTH_KEY',
+    MONTH: 'MONTH',
+    YEAR: 'YEAR',
+    PAYROLL_WORKINGS_FILE_NAME: 'PAYROLL_WORKINGS_FILE_NAME',
+    PAYROLL_WORKINGS_FILE_ID: 'PAYROLL_WORKINGS_FILE_ID',
+    LOCKED_PAYROLL_FILE_ID: 'LOCKED_PAYROLL_FILE_ID',
+    CREATED_ON: 'CREATED_ON',
+    CREATED_BY: 'CREATED_BY',
+  }),
+
+  CONFIG_KEYS: Object.freeze({
+    TEMPLATE_FILE_ID: 'TEMPLATE_PAYROLL_GENERATOR_FILE_ID',
+    WORKINGS_FOLDER_ID: 'MONTHLY_PAYROLL_WORKINGS_FOLDER_ID',
+    LOCKED_PAYROLL_FOLDER_ID: 'LOCKED_PAYROLL_FILES_FOLDER_ID',
+    BANK_TRANSFER_FOLDER_ID: 'BANK_TRANSFER_FILES_FOLDER_ID',
+    CONTROL_FILE_NAME: 'CONTROL_FILE_NAME',
+  }),
+
+  META_KEYS: Object.freeze({
+    PAYROLL_MONTH_LABEL: 'PAYROLL_MONTH_LABEL',
+    LOCK_STATUS: 'LOCK_STATUS',
+  }),
+
+  VALUES: Object.freeze({
+    LOCK_STATUS_OPEN: 'OPEN',
+  }),
+
+  PROTECTION: Object.freeze({
+    DESCRIPTION_PREFIX: 'PCC_MANAGED_PROTECTION',
+  }),
+});
+
+/**
+ * SINGLE MENU FOR THIS FILE
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Payroll Control')
+    .addItem('Generate Payroll Workings', 'generatePayrollWorkings')
+    .addToUi();
+}
+
+/**
+ * MAIN
+ */
+function generatePayrollWorkings() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const protectionContext = {
+    sheet: null,
+    protectedRows: [],
+    headerMap: null,
+  };
+
+  try {
+    const config = getConfigMap_();
+
+    validateControlFileName_(ss, config);
+
+    const sh = ss.getSheetByName(PCC.SHEETS.PAYROLL_CONTROL);
+    if (!sh) throw new Error(`Sheet not found: ${PCC.SHEETS.PAYROLL_CONTROL}`);
+
+    const headerMap = getHeaderMap_(sh, PCC.INPUTS.HEADER_ROW);
+    protectionContext.sheet = sh;
+    protectionContext.headerMap = headerMap;
+
+    validateRequiredHeaders_(headerMap, [
+      PCC.HEADERS.PAYROLL_MONTH_KEY,
+      PCC.HEADERS.MONTH,
+      PCC.HEADERS.YEAR,
+      PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME,
+      PCC.HEADERS.PAYROLL_WORKINGS_FILE_ID,
+      PCC.HEADERS.LOCKED_PAYROLL_FILE_ID,
+      PCC.HEADERS.CREATED_ON,
+      PCC.HEADERS.CREATED_BY,
+    ]);
+
+    const existingProtectedRows = getProtectedRowsByFileName_(sh, headerMap);
+    protectionContext.protectedRows = existingProtectedRows;
+
+    // Step 1: remove existing script-managed protections before checks
+    removeScriptManagedProtections_(sh);
+
+    // Step 2: read inputs
+    const month = String(sh.getRange(PCC.INPUTS.MONTH_CELL).getDisplayValue() || '').trim();
+    const year = String(sh.getRange(PCC.INPUTS.YEAR_CELL).getDisplayValue() || '').trim();
+
+    if (!month) {
+      ui.alert('Generate Payroll Workings', 'Month is blank. Please select Month in B2.', ui.ButtonSet.OK);
+      restoreManagedProtections_(sh, headerMap, existingProtectedRows);
+      return;
+    }
+
+    if (!year) {
+      ui.alert('Generate Payroll Workings', 'Year is blank. Please select Year in C2.', ui.ButtonSet.OK);
+      restoreManagedProtections_(sh, headerMap, existingProtectedRows);
+      return;
+    }
+
+    if (!/^\d{4}$/.test(year)) {
+      ui.alert('Generate Payroll Workings', 'Year must be a 4-digit value.', ui.ButtonSet.OK);
+      restoreManagedProtections_(sh, headerMap, existingProtectedRows);
+      return;
+    }
+
+    const payrollMonthKey = `${month}_${year}`;
+    const fileName = `Payroll-Workings_${month}_${year}`;
+
+    // Step 3: duplicate checks inside control sheet
+    const duplicateCheck = checkDuplicateInControl_(sh, headerMap, payrollMonthKey, fileName);
+    if (duplicateCheck.block) {
+      ui.alert('Generate Payroll Workings', duplicateCheck.message, ui.ButtonSet.OK);
+      restoreManagedProtections_(sh, headerMap, existingProtectedRows);
+      return;
+    }
+
+    // Step 4: duplicate check in target folder
+    const workingsFolderId = String(config[PCC.CONFIG_KEYS.WORKINGS_FOLDER_ID] || '').trim();
+    if (!workingsFolderId) throw new Error(`Missing CONFIG value: ${PCC.CONFIG_KEYS.WORKINGS_FOLDER_ID}`);
+
+    if (folderHasExactFileName_(workingsFolderId, fileName)) {
+      ui.alert(
+        'Generate Payroll Workings',
+        `A workings file named "${fileName}" already exists in the Monthly Payroll Workings folder. Duplicate creation is blocked.`,
+        ui.ButtonSet.OK
+      );
+      restoreManagedProtections_(sh, headerMap, existingProtectedRows);
+      return;
+    }
+
+    // Step 5: create file copy
+    const templateFileId = String(config[PCC.CONFIG_KEYS.TEMPLATE_FILE_ID] || '').trim();
+    if (!templateFileId) throw new Error(`Missing CONFIG value: ${PCC.CONFIG_KEYS.TEMPLATE_FILE_ID}`);
+
+    const templateFile = DriveApp.getFileById(templateFileId);
+    const workingsFolder = DriveApp.getFolderById(workingsFolderId);
+
+    const copiedFile = templateFile.makeCopy(fileName, workingsFolder);
+    const copiedFileId = copiedFile.getId();
+    const copiedFileUrl = buildSpreadsheetUrl_(copiedFileId);
+
+    // Step 6: update copied file META_DATA
+    const copiedSs = SpreadsheetApp.openById(copiedFileId);
+    updateMetaDataKeys_(copiedSs, {
+      [PCC.META_KEYS.PAYROLL_MONTH_LABEL]: payrollMonthKey,
+      [PCC.META_KEYS.LOCK_STATUS]: PCC.VALUES.LOCK_STATUS_OPEN,
+    });
+
+    // Step 7: write next empty row in PAYROLL_CONTROL
+    const nextRow = findNextEmptyRowByColumn_(sh, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME]);
+
+    const createdOn = new Date();
+    const createdBy = Session.getActiveUser().getEmail() || '';
+
+    sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_MONTH_KEY]).setValue(payrollMonthKey);
+    sh.getRange(nextRow, headerMap[PCC.HEADERS.MONTH]).setValue(month);
+    sh.getRange(nextRow, headerMap[PCC.HEADERS.YEAR]).setValue(year);
+    sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME])
+      .setFormula(`=HYPERLINK("${copiedFileUrl}","${escapeForFormula_(fileName)}")`);
+    sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_ID]).setValue(copiedFileUrl);
+    sh.getRange(nextRow, headerMap[PCC.HEADERS.CREATED_ON]).setValue(createdOn);
+    sh.getRange(nextRow, headerMap[PCC.HEADERS.CREATED_BY]).setValue(createdBy);
+
+    SpreadsheetApp.flush();
+
+    // Step 8: rebuild protections including new row
+    const rowsToProtect = existingProtectedRows.slice();
+    rowsToProtect.push(nextRow);
+    restoreManagedProtections_(sh, headerMap, rowsToProtect);
+
+    ui.alert(
+      'Generate Payroll Workings',
+      `Payroll workings file created successfully.\n\nFile Name: ${fileName}\nRow: ${nextRow}`,
+      ui.ButtonSet.OK
+    );
+
+  } catch (err) {
+    try {
+      if (protectionContext.sheet && protectionContext.headerMap) {
+        removeScriptManagedProtections_(protectionContext.sheet);
+        restoreManagedProtections_(protectionContext.sheet, protectionContext.headerMap, protectionContext.protectedRows || []);
+      }
+    } catch (restoreErr) {
+      // keep original error as main failure
+    }
+
+    SpreadsheetApp.getUi().alert(
+      'Generate Payroll Workings',
+      `Error: ${err && err.message ? err.message : err}`,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    throw err;
+  }
+}
+
+/**
+ * Reads CONFIG sheet as key/value map.
+ * Expected:
+ * Column A = KEY
+ * Column B = VALUE
+ */
+function getConfigMap_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(PCC.SHEETS.CONFIG);
+  if (!sh) throw new Error(`Sheet not found: ${PCC.SHEETS.CONFIG}`);
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 1) throw new Error('CONFIG sheet is empty.');
+
+  const values = sh.getRange(1, 1, lastRow, 2).getDisplayValues();
+  const map = {};
+
+  for (let i = 0; i < values.length; i++) {
+    const key = String(values[i][0] || '').trim();
+    const value = String(values[i][1] || '').trim();
+    if (key) map[key] = value;
+  }
+
+  return map;
+}
+
+/**
+ * Validates active file name against CONFIG.
+ */
+function validateControlFileName_(ss, config) {
+  const expectedName = String(config[PCC.CONFIG_KEYS.CONTROL_FILE_NAME] || '').trim();
+  if (!expectedName) throw new Error(`Missing CONFIG value: ${PCC.CONFIG_KEYS.CONTROL_FILE_NAME}`);
+
+  const actualName = String(ss.getName() || '').trim();
+  if (actualName !== expectedName) {
+    throw new Error(`This script must run from "${expectedName}" only. Current file: "${actualName}"`);
+  }
+}
+
+/**
+ * Header map: { HEADER_NAME: columnNumber }
+ */
+function getHeaderMap_(sheet, headerRow) {
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0];
+  const map = {};
+
+  for (let c = 0; c < headers.length; c++) {
+    const h = String(headers[c] || '').trim();
+    if (h) map[h] = c + 1;
+  }
+
+  return map;
+}
+
+function validateRequiredHeaders_(headerMap, requiredHeaders) {
+  const missing = requiredHeaders.filter(h => !headerMap[h]);
+  if (missing.length) {
+    throw new Error(`Missing required headers in PAYROLL_CONTROL: ${missing.join(', ')}`);
+  }
+}
+
+/**
+ * Returns rows that already have PAYROLL_WORKINGS_FILE_NAME filled.
+ * These are the rows to restore protections for.
+ */
+function getProtectedRowsByFileName_(sheet, headerMap) {
+  const col = headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME];
+  const lastRow = sheet.getLastRow();
+  if (lastRow < PCC.INPUTS.FIRST_DATA_ROW) return [];
+
+  const values = sheet.getRange(PCC.INPUTS.FIRST_DATA_ROW, col, lastRow - PCC.INPUTS.HEADER_ROW, 1).getDisplayValues();
+  const rows = [];
+
+  for (let i = 0; i < values.length; i++) {
+    const v = String(values[i][0] || '').trim();
+    if (v) rows.push(PCC.INPUTS.FIRST_DATA_ROW + i);
+  }
+
+  return rows;
+}
+
+/**
+ * Duplicate checks inside PAYROLL_CONTROL:
+ * 1) same month key + PAYROLL_WORKINGS_FILE_NAME already filled => block
+ * 2) same month key + LOCKED_PAYROLL_FILE_ID already filled => block
+ * 3) exact file name already visible in PAYROLL_WORKINGS_FILE_NAME column => block
+ */
+function checkDuplicateInControl_(sheet, headerMap, payrollMonthKey, fileName) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < PCC.INPUTS.FIRST_DATA_ROW) {
+    return { block: false, message: '' };
+  }
+
+  const lastCol = sheet.getLastColumn();
+  const data = sheet.getRange(PCC.INPUTS.FIRST_DATA_ROW, 1, lastRow - PCC.INPUTS.HEADER_ROW, lastCol).getDisplayValues();
+
+  const monthKeyCol = headerMap[PCC.HEADERS.PAYROLL_MONTH_KEY] - 1;
+  const fileNameCol = headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME] - 1;
+  const lockedPayrollCol = headerMap[PCC.HEADERS.LOCKED_PAYROLL_FILE_ID] - 1;
+
+  for (let i = 0; i < data.length; i++) {
+    const rowNum = PCC.INPUTS.FIRST_DATA_ROW + i;
+    const rowMonthKey = String(data[i][monthKeyCol] || '').trim();
+    const rowFileNameDisplay = String(data[i][fileNameCol] || '').trim();
+    const rowLockedPayroll = String(data[i][lockedPayrollCol] || '').trim();
+
+    if (rowFileNameDisplay === fileName) {
+      return {
+        block: true,
+        message: `A row already exists for "${fileName}" in PAYROLL_CONTROL (row ${rowNum}). Duplicate creation is blocked.`,
+      };
+    }
+
+    if (rowMonthKey === payrollMonthKey && rowFileNameDisplay) {
+      return {
+        block: true,
+        message: `Payroll workings already exists for month "${payrollMonthKey}" in row ${rowNum}. Duplicate creation is blocked.`,
+      };
+    }
+
+    if (rowMonthKey === payrollMonthKey && rowLockedPayroll) {
+      return {
+        block: true,
+        message: `A locked payroll reference already exists for month "${payrollMonthKey}" in row ${rowNum}. New workings creation is blocked.`,
+      };
+    }
+  }
+
+  return { block: false, message: '' };
+}
+
+/**
+ * Exact file name check in target folder.
+ */
+function folderHasExactFileName_(folderId, fileName) {
+  const folder = DriveApp.getFolderById(folderId);
+  const files = folder.getFilesByName(fileName);
+  return files.hasNext();
+}
+
+/**
+ * Updates META_DATA tab in copied file.
+ * Expected structure:
+ * Column A = KEY
+ * Column B = VALUE
+ * Only updates keys that exist. Does not clear anything else.
+ */
+function updateMetaDataKeys_(spreadsheet, updates) {
+  const sh = spreadsheet.getSheetByName(PCC.SHEETS.META_DATA);
+  if (!sh) throw new Error(`Sheet not found in copied file: ${PCC.SHEETS.META_DATA}`);
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) throw new Error('META_DATA does not contain enough rows.');
+
+  const keys = sh.getRange(1, 1, lastRow, 2).getDisplayValues();
+  const foundRows = {};
+
+  for (let i = 0; i < keys.length; i++) {
+    const key = String(keys[i][0] || '').trim();
+    if (key) foundRows[key] = i + 1;
+  }
+
+  Object.keys(updates).forEach(key => {
+    if (foundRows[key]) {
+      sh.getRange(foundRows[key], 2).setValue(updates[key]);
+    }
+  });
+}
+
+/**
+ * Next empty row based on target column.
+ */
+function findNextEmptyRowByColumn_(sheet, columnNumber) {
+  const lastRow = Math.max(sheet.getLastRow(), PCC.INPUTS.FIRST_DATA_ROW);
+  const numRows = Math.max(1, lastRow - PCC.INPUTS.HEADER_ROW);
+  const values = sheet.getRange(PCC.INPUTS.FIRST_DATA_ROW, columnNumber, numRows, 1).getDisplayValues();
+
+  for (let i = 0; i < values.length; i++) {
+    const v = String(values[i][0] || '').trim();
+    if (!v) return PCC.INPUTS.FIRST_DATA_ROW + i;
+  }
+
+  return lastRow + 1;
+}
+
+function buildSpreadsheetUrl_(fileId) {
+  return `https://docs.google.com/spreadsheets/d/${fileId}/edit`;
+}
+
+function escapeForFormula_(text) {
+  return String(text || '').replace(/"/g, '""');
+}
+
+/**
+ * Removes only script-managed protections.
+ */
+function removeScriptManagedProtections_(sheet) {
+  const protections = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE);
+
+  protections.forEach(protection => {
+    const desc = String(protection.getDescription() || '');
+    if (desc.indexOf(PCC.PROTECTION.DESCRIPTION_PREFIX) === 0) {
+      protection.remove();
+    }
+  });
+}
+
+/**
+ * Recreates protections for the required cells in each protected row:
+ * - PAYROLL_MONTH_KEY, MONTH, YEAR
+ * - PAYROLL_WORKINGS_FILE_NAME, PAYROLL_WORKINGS_FILE_ID
+ * - CREATED_ON, CREATED_BY
+ */
+function restoreManagedProtections_(sheet, headerMap, rowNumbers) {
+  const uniqueRows = Array.from(new Set((rowNumbers || []).filter(r => Number(r) >= PCC.INPUTS.FIRST_DATA_ROW))).sort((a, b) => a - b);
+  if (!uniqueRows.length) return;
+
+  uniqueRows.forEach(rowNum => {
+    protectRangeBlock_(sheet, rowNum, headerMap[PCC.HEADERS.PAYROLL_MONTH_KEY], headerMap[PCC.HEADERS.YEAR], `ROW_${rowNum}_A`);
+    protectRangeBlock_(sheet, rowNum, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME], headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_ID], `ROW_${rowNum}_B`);
+    protectRangeBlock_(sheet, rowNum, headerMap[PCC.HEADERS.CREATED_ON], headerMap[PCC.HEADERS.CREATED_BY], `ROW_${rowNum}_C`);
+  });
+}
+
+function protectRangeBlock_(sheet, rowNum, startCol, endCol, suffix) {
+  if (!startCol || !endCol) return;
+
+  const range = sheet.getRange(rowNum, startCol, 1, endCol - startCol + 1);
+  const protection = range.protect();
+  protection.setDescription(`${PCC.PROTECTION.DESCRIPTION_PREFIX}_${suffix}`);
+
+  const me = Session.getEffectiveUser();
+  const editors = protection.getEditors();
+  if (editors.length) protection.removeEditors(editors);
+
+  protection.addEditor(me);
+
+  if (protection.canDomainEdit()) {
+    protection.setDomainEdit(false);
+  }
+}
