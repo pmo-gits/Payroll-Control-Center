@@ -83,6 +83,18 @@ function onOpen() {
 function generatePayrollWorkings() {
   const ui = SpreadsheetApp.getUi();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lock = LockService.getScriptLock();
+
+  try {
+    lock.waitLock(30000);
+  } catch (e) {
+    ui.alert(
+      'Generate Payroll Workings',
+      'Another payroll workings generation is already running. Please wait a moment and try again.',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
 
   const protectionContext = {
     sheet: null,
@@ -193,8 +205,7 @@ function generatePayrollWorkings() {
     sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_MONTH_KEY]).setValue(payrollMonthKey);
     sh.getRange(nextRow, headerMap[PCC.HEADERS.MONTH]).setValue(month);
     sh.getRange(nextRow, headerMap[PCC.HEADERS.YEAR]).setValue(year);
-    sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME])
-      .setFormula(`=HYPERLINK("${copiedFileUrl}","${escapeForFormula_(fileName)}")`);
+    sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_NAME]).setValue(fileName);
     sh.getRange(nextRow, headerMap[PCC.HEADERS.PAYROLL_WORKINGS_FILE_ID]).setValue(copiedFileUrl);
     sh.getRange(nextRow, headerMap[PCC.HEADERS.CREATED_ON]).setValue(createdOn);
     sh.getRange(nextRow, headerMap[PCC.HEADERS.CREATED_BY]).setValue(createdBy);
@@ -228,6 +239,12 @@ function generatePayrollWorkings() {
       SpreadsheetApp.getUi().ButtonSet.OK
     );
     throw err;
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {
+      // no-op
+    }
   }
 }
 
@@ -419,10 +436,6 @@ function findNextEmptyRowByColumn_(sheet, columnNumber) {
 
 function buildSpreadsheetUrl_(fileId) {
   return `https://docs.google.com/spreadsheets/d/${fileId}/edit`;
-}
-
-function escapeForFormula_(text) {
-  return String(text || '').replace(/"/g, '""');
 }
 
 /**
